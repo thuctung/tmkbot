@@ -1,202 +1,293 @@
 """
-TradingView Webhook → EMA Signal → Telegram Notifier
-Nhận tín hiệu từ TradingView, tính EMA50/EMA200, gửi cảnh báo Telegram
+Gold EMA Bot — Tự động theo dõi giá Vàng (XAUUSD)
+Nguồn giá: Forex-Data-Feed qua yfinance (GC=F) hoặc fallback Metals API
+Kiểm tra mỗi 5 phút → tính EMA50/EMA200 → gửi Telegram khi có tín hiệu
 """
 
-import os
-import json
-import logging
+import os, time, logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
-from flask import Flask, request, jsonify
 
 # ── Cấu hình ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")   # Bot token từ @BotFather
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") # Chat/Group ID
-WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "my_secret_key")  # Bảo mật webhook
-MAX_CANDLES     = 210  # Giữ đủ nến để tính EMA200
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "300"))   # 5 phút = 300 giây
+TOUCH_THRESHOLD  = float(os.getenv("TOUCH_THRESHOLD", "0.001"))  # ±0.1%
+MAX_BARS         = 250  # Giữ đủ để tính EMA200
 
 EMA_SHORT = 50
 EMA_LONG  = 200
 
-# ── App & Logging ──────────────────────────────────────────────────────────────
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
-# ── Lưu trữ nến theo từng symbol/timeframe ────────────────────────────────────
-# Cấu trúc: price_store[symbol][timeframe] = deque of close prices
-price_store: dict[str, dict[str, deque]] = {}
+# ── Buffer giá & trạng thái ───────────────────────────────────────────────────
+price_buf: deque[float] = deque(maxlen=MAX_BARS)
+prev_state: dict = {"close": None, "ema50": None, "ema200": None}
 
-# Trạng thái tín hiệu trước đó (để phát hiện cross)
-signal_state: dict[str, dict] = {}
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. LẤY GIÁ VÀNG
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Helper: Tính EMA ──────────────────────────────────────────────────────────
+def fetch_gold_yfinance() -> float | None:
+    """Lấy giá vàng mới nhất từ Yahoo Finance (GC=F = Gold Futures)."""
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("GC=F")
+        df = ticker.history(period="1d", interval="5m")
+        if df.empty:
+            return None
+        price = float(df["Close"].iloc[-1])
+        log.info(f"[yfinance] XAUUSD = {price:.2f}")
+        return price
+    except Exception as e:
+        log.warning(f"[yfinance] Lỗi: {e}")
+        return None
+
+
+def fetch_gold_metals_api() -> float | None:
+    """
+    Fallback: Metals-API free tier
+    Đăng ký miễn phí tại https://metals-api.com → lấy API key
+    Điền vào biến môi trường METALS_API_KEY
+    """
+    api_key = os.getenv("METALS_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        url = f"https://metals-api.com/api/latest?access_key={api_key}&base=USD&symbols=XAU"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        # Trả về USD/troy oz
+        xau_per_usd = data["rates"]["XAU"]
+        price = round(1 / xau_per_usd, 2)  # Convert: giá 1 oz vàng tính bằng USD
+        log.info(f"[metals-api] XAUUSD = {price:.2f}")
+        return price
+    except Exception as e:
+        log.warning(f"[metals-api] Lỗi: {e}")
+        return None
+
+
+def fetch_gold_frankfurter() -> float | None:
+    """
+    Fallback 2: frankfurter.app (hoàn toàn free, không cần key)
+    Chỉ có giá cuối ngày — dùng khi không có nguồn nào khác.
+    """
+    try:
+        r = requests.get("https://api.frankfurter.app/latest?from=XAU&to=USD", timeout=10)
+        data = r.json()
+        price = round(data["rates"]["USD"], 2)
+        log.info(f"[frankfurter] XAUUSD = {price:.2f}")
+        return price
+    except Exception as e:
+        log.warning(f"[frankfurter] Lỗi: {e}")
+        return None
+
+
+def get_gold_price() -> float | None:
+    """Thử các nguồn theo thứ tự ưu tiên."""
+    return (
+        fetch_gold_yfinance()
+        or fetch_gold_metals_api()
+        or fetch_gold_frankfurter()
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. TÍNH EMA
+# ══════════════════════════════════════════════════════════════════════════════
+
 def calc_ema(prices: list[float], period: int) -> float | None:
-    """Tính EMA của `period` nến từ list giá đóng cửa."""
     if len(prices) < period:
         return None
     k = 2 / (period + 1)
     ema = prices[0]
-    for price in prices[1:]:
-        ema = price * k + ema * (1 - k)
-    return round(ema, 4)
+    for p in prices[1:]:
+        ema = p * k + ema * (1 - k)
+    return round(ema, 3)
 
-# ── Helper: Gửi Telegram ──────────────────────────────────────────────────────
-def send_telegram(message: str) -> bool:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. PHÁT HIỆN TÍN HIỆU
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_signals(close: float, ema50: float | None, ema200: float | None) -> list[str]:
+    global prev_state
+    signals = []
+
+    prev_close = prev_state["close"]
+    prev_e50   = prev_state["ema50"]
+    prev_e200  = prev_state["ema200"]
+
+    def near(price, ema):
+        return abs(price - ema) / ema <= TOUCH_THRESHOLD
+
+    def cross_above(now, ema_now, before, ema_before):
+        return (before is not None and ema_before is not None
+                and before <= ema_before and now > ema_now)
+
+    def cross_below(now, ema_now, before, ema_before):
+        return (before is not None and ema_before is not None
+                and before >= ema_before and now < ema_now)
+
+    # ── EMA50 ──────────────────────────────────────────────────────────────
+    if ema50:
+        if cross_above(close, ema50, prev_close, prev_e50):
+            signals.append(
+                f"🟢 <b>VÀNG (XAUUSD)</b> — Giá vượt lên EMA50 📈\n"
+                f"Giá: <b>${close:,.2f}</b>  |  EMA50: <b>${ema50:,.2f}</b>\n"
+                f"⚡ Tín hiệu: <i>Breakout ngắn hạn TĂNG</i>"
+            )
+        elif cross_below(close, ema50, prev_close, prev_e50):
+            signals.append(
+                f"🔴 <b>VÀNG (XAUUSD)</b> — Giá phá xuống EMA50 📉\n"
+                f"Giá: <b>${close:,.2f}</b>  |  EMA50: <b>${ema50:,.2f}</b>\n"
+                f"⚡ Tín hiệu: <i>Breakdown ngắn hạn GIẢM</i>"
+            )
+        elif near(close, ema50):
+            signals.append(
+                f"🔵 <b>VÀNG (XAUUSD)</b> — Giá đang chạm EMA50\n"
+                f"Giá: <b>${close:,.2f}</b>  |  EMA50: <b>${ema50:,.2f}</b>\n"
+                f"👀 <i>Quan sát vùng hỗ trợ / kháng cự</i>"
+            )
+
+    # ── EMA200 ─────────────────────────────────────────────────────────────
+    if ema200:
+        if cross_above(close, ema200, prev_close, prev_e200):
+            signals.append(
+                f"🚀 <b>VÀNG (XAUUSD)</b> — Giá vượt EMA200 — BULLISH MẠNH! 📈\n"
+                f"Giá: <b>${close:,.2f}</b>  |  EMA200: <b>${ema200:,.2f}</b>\n"
+                f"🔥 Tín hiệu: <i>Xu hướng tăng dài hạn xác nhận</i>"
+            )
+        elif cross_below(close, ema200, prev_close, prev_e200):
+            signals.append(
+                f"💀 <b>VÀNG (XAUUSD)</b> — Giá phá xuống EMA200 — BEARISH! 📉\n"
+                f"Giá: <b>${close:,.2f}</b>  |  EMA200: <b>${ema200:,.2f}</b>\n"
+                f"⚠️ Tín hiệu: <i>Cảnh báo đảo chiều xu hướng</i>"
+            )
+        elif near(close, ema200):
+            signals.append(
+                f"🟠 <b>VÀNG (XAUUSD)</b> — Giá đang chạm EMA200\n"
+                f"Giá: <b>${close:,.2f}</b>  |  EMA200: <b>${ema200:,.2f}</b>\n"
+                f"👀 <i>Vùng quan trọng — theo dõi sát</i>"
+            )
+
+    # Lưu trạng thái
+    prev_state = {"close": close, "ema50": ema50, "ema200": ema200}
+    return signals
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. GỬI TELEGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+
+def send_telegram(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram chưa cấu hình – bỏ qua gửi tin.")
+        log.warning("Chưa cấu hình Telegram — bỏ qua.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        log.info("Telegram gửi thành công.")
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+        }, timeout=10)
+        r.raise_for_status()
         return True
     except Exception as e:
         log.error(f"Telegram lỗi: {e}")
         return False
 
-# ── Logic phát hiện tín hiệu ──────────────────────────────────────────────────
-def detect_signals(symbol: str, tf: str, close: float,
-                   ema50: float | None, ema200: float | None) -> list[str]:
-    """
-    Phát hiện:
-    - Giá chạm / vượt EMA50  (±0.1%)
-    - Giá chạm / vượt EMA200 (±0.1%)
-    """
-    signals = []
-    key = f"{symbol}_{tf}"
-    prev = signal_state.get(key, {})
-    threshold = 0.001  # 0.1% vùng "chạm"
 
-    def near(price, ema):
-        return abs(price - ema) / ema <= threshold
+def send_status_update(close: float, ema50, ema200, bars: int):
+    """Gửi bản tin cập nhật định kỳ mỗi giờ."""
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    e50_str  = f"${ema50:,.2f}"  if ema50  else "Chưa đủ dữ liệu"
+    e200_str = f"${ema200:,.2f}" if ema200 else f"Cần thêm {EMA_LONG - bars} nến"
 
-    def crossed_above(price, ema, prev_price, prev_ema):
-        if prev_price is None or prev_ema is None:
-            return False
-        return prev_price <= prev_ema and price > ema
+    trend = "—"
+    if ema50 and ema200:
+        if close > ema50 > ema200:
+            trend = "📈 TĂNG mạnh (Giá > EMA50 > EMA200)"
+        elif close < ema50 < ema200:
+            trend = "📉 GIẢM mạnh (Giá < EMA50 < EMA200)"
+        elif ema50 > ema200:
+            trend = "🟡 Trung lập — EMA50 trên EMA200"
+        else:
+            trend = "🟡 Trung lập — EMA50 dưới EMA200"
 
-    def crossed_below(price, ema, prev_price, prev_ema):
-        if prev_price is None or prev_ema is None:
-            return False
-        return prev_price >= prev_ema and price < ema
-
-    prev_close = prev.get("close")
-    prev_ema50  = prev.get("ema50")
-    prev_ema200 = prev.get("ema200")
-
-    # ── EMA50 ──
-    if ema50:
-        if near(close, ema50):
-            signals.append(("touch_ema50", f"🔵 <b>{symbol} [{tf}]</b> Giá chạm EMA50\n"
-                            f"Giá: <b>{close}</b> | EMA50: <b>{ema50}</b>"))
-        elif crossed_above(close, ema50, prev_close, prev_ema50):
-            signals.append(("cross_above_ema50", f"🟢 <b>{symbol} [{tf}]</b> Giá vượt lên trên EMA50 📈\n"
-                            f"Giá: <b>{close}</b> | EMA50: <b>{ema50}</b>"))
-        elif crossed_below(close, ema50, prev_close, prev_ema50):
-            signals.append(("cross_below_ema50", f"🔴 <b>{symbol} [{tf}]</b> Giá phá xuống dưới EMA50 📉\n"
-                            f"Giá: <b>{close}</b> | EMA50: <b>{ema50}</b>"))
-
-    # ── EMA200 ──
-    if ema200:
-        if near(close, ema200):
-            signals.append(("touch_ema200", f"🟠 <b>{symbol} [{tf}]</b> Giá chạm EMA200\n"
-                            f"Giá: <b>{close}</b> | EMA200: <b>{ema200}</b>"))
-        elif crossed_above(close, ema200, prev_close, prev_ema200):
-            signals.append(("cross_above_ema200", f"🚀 <b>{symbol} [{tf}]</b> Giá vượt lên trên EMA200 – BULLISH 📈\n"
-                            f"Giá: <b>{close}</b> | EMA200: <b>{ema200}</b>"))
-        elif crossed_below(close, ema200, prev_close, prev_ema200):
-            signals.append(("cross_below_ema200", f"💀 <b>{symbol} [{tf}]</b> Giá phá xuống dưới EMA200 – BEARISH 📉\n"
-                            f"Giá: <b>{close}</b> | EMA200: <b>{ema200}</b>"))
-
-    # Lưu trạng thái
-    signal_state[key] = {"close": close, "ema50": ema50, "ema200": ema200}
-    return [s[1] for s in signals]
-
-# ── Webhook endpoint ───────────────────────────────────────────────────────────
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    """
-    TradingView gửi JSON dạng:
-    {
-      "secret":    "my_secret_key",
-      "symbol":    "BTCUSDT",
-      "timeframe": "1h",
-      "close":     67500.0
-    }
-    """
-    # Kiểm tra Content-Type
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "JSON không hợp lệ"}), 400
-
-    # Xác thực secret
-    if data.get("secret") != WEBHOOK_SECRET:
-        log.warning("Webhook secret sai!")
-        return jsonify({"error": "Unauthorized"}), 401
-
-    symbol = data.get("symbol", "UNKNOWN").upper()
-    tf     = data.get("timeframe", "?")
-    close  = float(data.get("close", 0))
-
-    if close <= 0:
-        return jsonify({"error": "Giá close không hợp lệ"}), 400
-
-    # Lưu giá vào buffer
-    if symbol not in price_store:
-        price_store[symbol] = {}
-    if tf not in price_store[symbol]:
-        price_store[symbol][tf] = deque(maxlen=MAX_CANDLES)
-
-    price_store[symbol][tf].append(close)
-    prices = list(price_store[symbol][tf])
-    count  = len(prices)
-
-    # Tính EMA
-    ema50  = calc_ema(prices, EMA_SHORT) if count >= EMA_SHORT  else None
-    ema200 = calc_ema(prices, EMA_LONG)  if count >= EMA_LONG   else None
-
-    log.info(f"{symbol} [{tf}] Close={close} | EMA50={ema50} | EMA200={ema200} | Bars={count}")
-
-    # Phát hiện và gửi tín hiệu
-    msgs = detect_signals(symbol, tf, close, ema50, ema200)
-    now  = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-
-    for msg in msgs:
-        full_msg = f"{msg}\n🕐 {now}"
-        log.info(f"Tín hiệu: {full_msg}")
-        send_telegram(full_msg)
-
-    return jsonify({
-        "symbol":  symbol,
-        "tf":      tf,
-        "close":   close,
-        "ema50":   ema50,
-        "ema200":  ema200,
-        "bars":    count,
-        "signals": len(msgs),
-    }), 200
+    msg = (
+        f"📊 <b>CẬP NHẬT GIÁ VÀNG</b> — {now}\n"
+        f"{'─'*28}\n"
+        f"💰 Giá hiện tại: <b>${close:,.2f}</b>\n"
+        f"📉 EMA50:  <b>{e50_str}</b>\n"
+        f"📉 EMA200: <b>{e200_str}</b>\n"
+        f"📌 Xu hướng: {trend}\n"
+        f"📦 Dữ liệu: {bars} nến 5 phút"
+    )
+    send_telegram(msg)
 
 
-# ── Status endpoint ────────────────────────────────────────────────────────────
-@app.route("/status", methods=["GET"])
-def status():
-    summary = {}
-    for sym, tfs in price_store.items():
-        summary[sym] = {tf: len(prices) for tf, prices in tfs.items()}
-    return jsonify({"status": "ok", "data": summary})
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. VÒNG LẶP CHÍNH
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run():
+    log.info("🚀 Gold EMA Bot khởi động...")
+    send_telegram("🤖 <b>Gold EMA Bot đã khởi động!</b>\nTheo dõi XAUUSD mỗi 5 phút\nEMA50 & EMA200 | Tín hiệu chạm và vượt")
+
+    hourly_counter = 0  # Gửi status mỗi 12 lần (= 1 giờ)
+
+    while True:
+        try:
+            close = get_gold_price()
+
+            if close is None:
+                log.warning("Không lấy được giá — thử lại sau.")
+                time.sleep(60)
+                continue
+
+            price_buf.append(close)
+            prices = list(price_buf)
+            bars   = len(prices)
+
+            ema50  = calc_ema(prices, EMA_SHORT) if bars >= EMA_SHORT else None
+            ema200 = calc_ema(prices, EMA_LONG)  if bars >= EMA_LONG  else None
+
+            log.info(
+                f"Giá=${close:,.2f} | EMA50={ema50 or 'N/A'} | "
+                f"EMA200={ema200 or 'N/A'} | Bars={bars}/{MAX_BARS}"
+            )
+
+            # Phát hiện và gửi tín hiệu
+            signals = detect_signals(close, ema50, ema200)
+            now_str = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+            for sig in signals:
+                send_telegram(f"{sig}\n🕐 {now_str}")
+                log.info(f"📨 Đã gửi tín hiệu Telegram")
+
+            # Gửi status mỗi 1 giờ
+            hourly_counter += 1
+            if hourly_counter >= 12:
+                send_status_update(close, ema50, ema200, bars)
+                hourly_counter = 0
+
+            # Cảnh báo nếu chưa đủ dữ liệu (chỉ log, không spam Telegram)
+            if bars < EMA_LONG:
+                log.info(f"⏳ Đang thu thập dữ liệu: {bars}/{EMA_LONG} nến để tính EMA200")
+
+        except Exception as e:
+            log.error(f"Lỗi vòng lặp: {e}", exc_info=True)
+
+        time.sleep(CHECK_INTERVAL)
 
 
-# ── Chạy local ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    run()
